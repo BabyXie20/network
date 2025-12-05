@@ -61,6 +61,71 @@ class ResidualConvBlock(nn.Module):
         return out
 
 
+class FreqFuse3D(nn.Module):
+    """
+    输入:
+        low: [B, C, D, H, W]      低频子带（LLL）
+        highs: [B, C, 7, D, H, W] 高频子带（7个）
+    
+    输出:
+        [B, C, D, H, W] 融合后的特征
+    """
+    def __init__(self, channels, normalization='instancenorm', reduction=4):
+        super().__init__()
+        self.channels = channels
+
+        # 7 个高频子带聚合的 1x1x1 卷积
+        self.high_agg_conv = nn.Conv3d(channels * 7, channels, kernel_size=1, bias=False)
+
+        # 频段注意力：[B,7] -> [B,7] 的权重
+        hidden = max(7 * 2, 8)
+        self.band_mlp = nn.Sequential(
+            nn.Linear(7, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 7),
+            nn.Sigmoid()
+        )
+
+        # 通道注意力：SE-style
+        mid_ch = max(channels // reduction, 8)
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),                  # [B, C, 1, 1, 1]
+            nn.Conv3d(channels, mid_ch, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid_ch, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, low, highs):
+        """
+        low: [B, C, D, H, W]
+        highs: [B, C, 7, D, H, W]
+        返回: [B, C, D, H, W]
+        """
+        B, C, S, D, H, W = highs.shape
+        assert S == 7, f"Expect 7 high-frequency subbands, got {S}"
+
+        # 1) 频段描述：全局平均池化
+        band_desc = highs.mean(dim=(3, 4, 5))   # [B, C, 7]
+        band_desc = band_desc.mean(dim=1)       # [B, 7]
+
+        # 2) MLP 生成 band-wise 权重
+        band_weights = self.band_mlp(band_desc)         # [B, 7]
+        band_weights = band_weights.view(B, 1, S, 1, 1, 1)  # [B, 1, 7, 1, 1, 1]
+
+        # 3) 对高频子带加权
+        highs_weighted = highs * band_weights           # [B, C, 7, D, H, W]
+
+        # 4) 聚合 7 个子带：reshape -> 1x1x1 Conv
+        highs_reshaped = highs_weighted.view(B, C * S, D, H, W)  # [B, 7C, D, H, W]
+        high_agg = self.high_agg_conv(highs_reshaped)            # [B, C, D, H, W]
+
+        # 5) 与低频融合 + 通道注意力 + 残差细化
+        base = low + high_agg                       # [B, C, D, H, W]
+        ch_att = self.channel_att(base)             # [B, C, 1, 1, 1]
+        fused = base * ch_att                       # [B, C, D, H, W]
+    
+        return fused
 
 
 
@@ -69,3 +134,4 @@ __all__ = [
     'ResidualConvBlock',
 
 ]
+
